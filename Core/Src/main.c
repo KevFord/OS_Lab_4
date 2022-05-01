@@ -24,6 +24,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "lcd.h"
+#include "semphr.h"
+#include "stdio.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -58,10 +60,24 @@ osThreadId ReadADCHandle;
 osThreadId RGB_LedHandle;
 osThreadId WriteLCDHandle;
 /* USER CODE BEGIN PV */
-uint16_t ADC_Data;
-traceString adc_ch;
-//traceString chn0; // Moved to h file, uint16_t chn0
+uint16_t ADC_Data; // 3.1.3
+
 TextLCDType lcd;
+
+char g_str_top[16] = "ADC Value:      ";
+char g_str_btm[16];
+
+SemaphoreHandle_t adcMutex;
+SemaphoreHandle_t strMutex;
+
+enum color_state { RED, BLUE, YELLOW, GREEN, OFF };
+enum color_state state;
+
+TickType_t lcd_diff;
+TickType_t rgb_diff;
+TickType_t default_diff;
+TickType_t adc_diff;
+TickType_t blink_diff;
 
 /* USER CODE END PV */
 
@@ -81,23 +97,21 @@ void StartTaskRGB(void const * argument);
 void StartTaskWriteLCD(void const * argument);
 
 /* USER CODE BEGIN PFP */
-void setRGB(uint8_t r, uint8_t g, uint8_t b);
+void setRGB(uint8_t r, uint8_t g, uint8_t b); // 3.2.3
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-void setRGB(uint8_t r, uint8_t g, uint8_t b){
+void setRGB(uint8_t r, uint8_t g, uint8_t b){ // 3.2.1/2
 
 	r = r ? GPIO_PIN_SET : GPIO_PIN_RESET; // ternary
 	g = g ? GPIO_PIN_SET : GPIO_PIN_RESET;
 	b = b ? GPIO_PIN_SET : GPIO_PIN_RESET;
-//	HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, r);
-//	HAL_GPIO_WritePin(LED_G_GPIO_Port, LED_G_Pin, g);
-//	HAL_GPIO_WritePin(LED_B_GPIO_Port, LED_B_Pin, b);
-	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_2, r);
-	HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, g);
-	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, b);
+
+	HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, r);
+	HAL_GPIO_WritePin(LED_G_GPIO_Port, LED_G_Pin, g);
+	HAL_GPIO_WritePin(LED_B_GPIO_Port, LED_B_Pin, b);
 }
 /* USER CODE END 0 */
 
@@ -126,7 +140,7 @@ int main(void)
   /* USER CODE BEGIN SysInit */
   vTraceEnable(TRC_START);
   chn0 = xTraceRegisterString("chn0");
-  adc_ch = xTraceRegisterString("adc"); // 3.1.5
+  adc_ch = xTraceRegisterString("ADC:"); // 3.1.5
   vTracePrintF(chn0, "I am tracing channel %d", 0);
   /* USER CODE END SysInit */
 
@@ -139,11 +153,13 @@ int main(void)
   MX_I2C1_Init();
   MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
+
   TextLCD_Init(&lcd, &hi2c1, 0x4E); // "startar" LCD
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
+  adcMutex = xSemaphoreCreateMutex();
+  strMutex = xSemaphoreCreateMutex();
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -595,11 +611,16 @@ static void MX_GPIO_Init(void)
 void StartDefaultTask(void const * argument)
 {
   /* USER CODE BEGIN 5 */
+
+	TickType_t default_start;
+	TickType_t default_stop;
   /* Infinite loop */
   for(;;)
   {
+	  default_start = xTaskGetTickCount();
 	  osDelay(1);
-
+	  default_stop = xTaskGetTickCount();
+	  default_diff = default_stop - default_start;
   }
   /* USER CODE END 5 */
 }
@@ -614,10 +635,11 @@ void StartDefaultTask(void const * argument)
 void StartBlinkyTask(void const * argument)
 {
   /* USER CODE BEGIN StartBlinkyTask */
+	TickType_t blink_start;
+	TickType_t blink_stop;
 	/* Infinite loop */
 	for(;;)
 	{
-
 //		void vTaskFunction( void * pvParameters )
 //		 {
 //		 // Block for 500ms.
@@ -630,10 +652,11 @@ void StartBlinkyTask(void const * argument)
 //				 vTaskDelay( xDelay );
 //			 }
 //		 }
+		blink_start = xTaskGetTickCount();
 		vTaskDelay(500);
-		HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
-		vTaskDelay(500);
-		HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+		HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+		blink_stop = xTaskGetTickCount();
+		blink_diff = blink_stop - blink_start;
 	}
   /* USER CODE END StartBlinkyTask */
 }
@@ -645,23 +668,40 @@ void StartBlinkyTask(void const * argument)
 * @retval None
 */
 /* USER CODE END Header_StartTaskADC */
-void StartTaskADC(void const * argument)
+void StartTaskADC(void const * argument) // 3.1.4
 {
   /* USER CODE BEGIN StartTaskADC */
+	TickType_t adc_start;
+	TickType_t adc_stop;
   /* Infinite loop */
   for(;;)
   {
+	  adc_start = xTaskGetTickCount();
 	  HAL_ADC_Start(&hadc1);
 	  HAL_ADC_PollForConversion(&hadc1, 100);
-	  ADC_Data = HAL_ADC_GetValue(&hadc1); // Write data to the buffer.
+	  if( xSemaphoreTake( adcMutex, ( TickType_t ) 10 ) == pdTRUE ) // Thread safety. 3.3
+	  {
+		  ADC_Data = HAL_ADC_GetValue(&hadc1); // Write data to the buffer.
+	      xSemaphoreGive( adcMutex );
+	  }
 	  HAL_ADC_Stop(&hadc1);
-	  vTaskDelay(100);
 
-	  vTracePrintF(adc_ch, "ADC Trace", 0); // Tracing purposes.
+	  char adc_str[30];
+	  sprintf(adc_str, "ADC Value: % 4d", ADC_Data);
+
+	  if( xSemaphoreTake( strMutex, ( TickType_t ) 10 ) == pdTRUE ) // Thread safety. 3.3
+	  {
+		  sprintf(g_str_btm, "%04d           ", ADC_Data);
+		  xSemaphoreGive( strMutex );
+	  }
+
+	  vTracePrintF(adc_ch, adc_str, 0); // Tracing purposes. 3.1.6
+	  vTaskDelay(100);
+	  adc_stop = xTaskGetTickCount();
+	  adc_diff = adc_stop - adc_start;
   }
   /* USER CODE END StartTaskADC */
 }
-
 /* USER CODE BEGIN Header_StartTaskRGB */
 /**
 * @brief Function implementing the RGB_Led thread.
@@ -669,67 +709,81 @@ void StartTaskADC(void const * argument)
 * @retval None
 */
 /* USER CODE END Header_StartTaskRGB */
-void StartTaskRGB(void const * argument)
+void StartTaskRGB(void const * argument) // 3.2. Working as intended:)
 {
   /* USER CODE BEGIN StartTaskRGB */
-
-	enum color_state{ RED, YELLOW, BLUE };
-
-	TickType_t period;
+	TickType_t wakeup_time;
 	const TickType_t periodTime = 150;
-
 	TickType_t last_red_tick = 0;
 	TickType_t last_blue_tick = 0;
-	TickType_t now;
 
-	period = xTaskGetTickCount();
+	TickType_t rgb_start;
+	TickType_t rgb_stop;
+
+	wakeup_time = xTaskGetTickCount();
 
   /* Infinite loop */
   for(;;)
   {
+	  rgb_start = xTaskGetTickCount();
+	  uint16_t ADC_DataLocal; // Local copy of the global ADC value.
+	  if( xSemaphoreTake( adcMutex, ( TickType_t ) 10 ) == pdTRUE ) // Thread safety, 3.3
+	  {
+		  ADC_DataLocal = ADC_Data; // Local copy of the global ADC value.
+		  xSemaphoreGive( adcMutex );
+	  }
+	  // Naive first pass, just set the color states as per 3.2.5:
+	  if(ADC_DataLocal > 3000)
+	  {
+		  state = RED; // Set color. 3.2.5
 
-	  uint16_t ADC_DataLocal = ADC_Data; // Local copy of the global ADC value.
+		  last_red_tick = wakeup_time + 1400; // wakeup_time is reset after every iteration of the loop.
+		  last_blue_tick = last_red_tick + 600; // Basically wakeup_time + 2k.
+	  }
+	  else if(ADC_DataLocal > 2000)
+	  {
+		  state = YELLOW;
+	  }
+	  else if(ADC_DataLocal > 1000)
+	  {
+		  state = GREEN;
+	  }
+	  else
+	  {
+		  state = OFF;
+	  }
+	  // Check if the timing has changed, is it time to delay the color state changes.
+	  if(last_blue_tick > wakeup_time)
+	  {
+		  state = BLUE;
+		  if(last_red_tick > wakeup_time)
+		  {
+			  state = RED;
+		  }
+	  }
 
-	  	  if(ADC_DataLocal > 3000){ // Red.
-
-	  		  setRGB(1, 0, 0); // Set color.
-
-	  		  if(ADC_DataLocal < 3000){
-
-				  last_red_tick = xTaskGetTickCount(); // Start value. Begins at the time of vTaskStartScheduler being initialized.
-				  now = 1400;
-
-				  vTaskDelayUntil( &last_red_tick, now ); // Keep red light on for 1400 ticks.
-
-				  setRGB(0,1,0); // Set the blue led.
-
-				  last_blue_tick = xTaskGetTickCount(); // Start value. Begins at the time of vTaskStartScheduler being initialized.
-				  now = 600;
-
-				  vTaskDelayUntil( &last_blue_tick, now ); // Keep blue light on for 600 ticks-
-	  		  }
-	  	  }
-
-	  else if(ADC_DataLocal > 2000){ // Yellow.
-
+	  switch (state)
+	  {
+	  case RED :
+		  setRGB(1, 0, 0);
+		  break;
+	  case BLUE :
+		  setRGB(0, 0, 1);
+		  break;
+	  case YELLOW :
 		  setRGB(1, 1, 0);
-	  }
-
-	  else if(ADC_DataLocal > 1000){ // Green.
-
+		  break;
+	  case GREEN :
 		  setRGB(0, 1, 0);
+		  break;
+	  case OFF :
+		  setRGB(0, 0, 0);
+		  break;
 	  }
 
-	  else setRGB(0, 0, 0); // Off. Working as intended.
-
-	  vTaskDelayUntil(&period, periodTime); // Set period to 150 ticks.
-
-//	  setRGB(1,0,0); // Red.
-//	  vTaskDelay(500);
-//	  setRGB(1,1,0); // Red + Greeen.
-//	  vTaskDelay(500);
-//	  setRGB(0,1,1); // Green + Blue.
-//	  vTaskDelay(500);
+	  vTaskDelayUntil(&wakeup_time, periodTime); // Set period to 150 ticks.
+	  rgb_stop = xTaskGetTickCount();
+	  rgb_diff = rgb_stop - rgb_start;
   }
   /* USER CODE END StartTaskRGB */
 }
@@ -744,33 +798,51 @@ void StartTaskRGB(void const * argument)
 void StartTaskWriteLCD(void const * argument) // OK.
 {
   /* USER CODE BEGIN StartTaskWriteLCD */
-	char *hello = "Hello";
-	char *world = "Word?";
 
-	TickType_t delayLCD;
+	TickType_t LCD_wakeup_time;
 	const TickType_t periodTime = 700;
 
+	TickType_t lcd_start;
+	TickType_t lcd_stop;
+
+	char hello[16] = "Hello           ";
+	char world[16] = "Word!           ";
+
+	char str_top[16];
+	char str_btm[16];
+
+	LCD_wakeup_time = xTaskGetTickCount();
 
   /* Infinite loop */
   for(;;)
   {
-	  delayLCD = xTaskGetTickCount();
+	  lcd_start = xTaskGetTickCount();
+
+//	  if( xSemaphoreTake( strMutex, ( TickType_t ) 10 ) == pdTRUE ) // Thread safety, 3.3
+//	  {
+//		  for (int i = 0; i < 16; i++)
+//		  {
+//			  str_top[i] = g_str_top[i];
+//			  str_btm[i] = g_str_btm[i];
+//		  }
+//		  xSemaphoreGive( strMutex );
+//	  }
 
 	  TextLCD_Home(&lcd);
-	  TextLCD_Puts(&lcd, hello);
+	  TextLCD_Puts(&lcd, hello); //str_top);
 	  TextLCD_Position(&lcd, 0, 1); // Second row, first character.
-	  TextLCD_Puts(&lcd, world);
+	  TextLCD_Puts(&lcd, world); //str_btm);
 
-	  vTaskDelayUntil(&delayLCD, periodTime); // Swap string every 700 ticks.
+	  vTaskDelayUntil(&LCD_wakeup_time, periodTime); // Swap string every 700 ticks.
 
 	  TextLCD_Home(&lcd);
-	  TextLCD_Puts(&lcd, world);
+	  TextLCD_Puts(&lcd, world); //str_btm);
 	  TextLCD_Position(&lcd, 0, 1); // Second row, first character.
-	  TextLCD_Puts(&lcd, hello);
+	  TextLCD_Puts(&lcd, hello); //str_top);
 
-	  vTaskDelayUntil(&delayLCD, periodTime); // Swap string every 700 ticks.
-
-	  TextLCD_Home(&lcd);
+	  vTaskDelayUntil(&LCD_wakeup_time, periodTime); // Swap string every 700 ticks.
+	  lcd_stop = xTaskGetTickCount();
+	  lcd_diff = lcd_stop - lcd_start;
   }
   /* USER CODE END StartTaskWriteLCD */
 }

@@ -10,7 +10,7 @@
 // D7 D6 D5 D4 BT E  RW RS
 // 4xdata, backlight (not working), enable/strobe, RW, RS
 
-#define STROBE_DELAY_USEC 400
+#define STROBE_DELAY_USEC 40
 
 
 // Works because TIM1 runs at 1 MHz

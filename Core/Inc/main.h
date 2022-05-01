@@ -38,6 +38,8 @@ extern "C" {
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
 uint16_t chn0;
+uint16_t adc_ch;
+
 /* USER CODE END ET */
 
 /* Exported constants --------------------------------------------------------*/
